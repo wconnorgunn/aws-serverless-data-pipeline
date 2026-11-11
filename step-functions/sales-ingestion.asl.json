@@ -1,0 +1,359 @@
+{
+  "Comment": "Documentation note: replace all <...> placeholders with your deployment's values. This file is a sanitized copy of a saved project state-machine version; not verified against the currently deployed AWS state machine. Versioned sales ingestion with Athena quality checks, per-batch curated publication, ledger lifecycle and SNS failure alerting",
+  "QueryLanguage": "JSONata",
+  "StartAt": "ValidateS3Event",
+  "States": {
+    "ValidateS3Event": {
+      "Type": "Pass",
+      "Output": {
+        "bucket": "{% $states.input.detail.bucket.name %}",
+        "objectKey": "{% $states.input.detail.object.key %}",
+        "versionId": "{% $states.input.detail.object.`version-id` %}",
+        "eventId": "{% $states.input.id %}",
+        "objectId": "{% $states.input.detail.bucket.name & '/' & $states.input.detail.object.key & '/' & $states.input.detail.object.`version-id` %}"
+      },
+      "Next": "CheckCSVFile"
+    },
+    "CheckCSVFile": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $exists($match($states.input.objectKey, /^incoming\\/sales\\/.*\\.csv$/i)) and $exists($states.input.versionId) %}",
+          "Next": "ClaimFile"
+        }
+      ],
+      "Default": "InvalidFile"
+    },
+    "ClaimFile": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Arguments": {
+        "TableName": "<INGESTION_LEDGER_TABLE>",
+        "Item": {
+          "objectId": {
+            "S": "{% $states.input.objectId %}"
+          },
+          "bucket": {
+            "S": "{% $states.input.bucket %}"
+          },
+          "objectKey": {
+            "S": "{% $states.input.objectKey %}"
+          },
+          "eventId": {
+            "S": "{% $states.input.eventId %}"
+          },
+          "status": {
+            "S": "PROCESSING"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(objectId)"
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ConditionalCheckFailedException"
+          ],
+          "Next": "DuplicateFile"
+        }
+      ],
+      "Next": "StageSalesFile"
+    },
+    "StageSalesFile": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "arn:aws:lambda:us-east-1:<AWS_ACCOUNT_ID>:function:<STAGING_LAMBDA_NAME>",
+        "Payload": {
+          "bucket": "{% $states.input.bucket %}",
+          "objectKey": "{% $states.input.objectKey %}",
+          "versionId": "{% $states.input.versionId %}"
+        }
+      },
+      "Output": {
+        "objectId": "{% $states.input.objectId %}",
+        "batchId": "{% $states.result.Payload.batchId %}",
+        "stagingBucket": "{% $states.result.Payload.stagingBucket %}",
+        "stagingKey": "{% $states.result.Payload.stagingKey %}",
+        "stagingUri": "{% $states.result.Payload.stagingUri %}"
+      },
+      "Next": "ValidateStagingResult",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ]
+    },
+    "ValidateStagingResult": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $exists($match($states.input.batchId, /^[a-f0-9]{64}$/)) and $states.input.stagingKey = 'automated/staging/' & $states.input.batchId & '/sales.csv' and $states.input.stagingBucket = '<SALES_BUCKET>' %}",
+          "Next": "TransformSalesToParquet"
+        }
+      ],
+      "Default": "MarkFailed"
+    },
+    "TransformSalesToParquet": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "{% 'UNLOAD (SELECT order_id, TRY_CAST(order_date AS DATE) AS order_date, customer_id, region, product_category, TRY_CAST(quantity AS INTEGER) AS quantity, TRY_CAST(unit_price AS DOUBLE) AS unit_price, TRY_CAST(quantity AS DOUBLE) * TRY_CAST(unit_price AS DOUBLE) AS revenue, order_status FROM <GLUE_DATABASE>.sales_staging WHERE \"$path\" = ' & \"'\" & 's3://<SALES_BUCKET>/automated/staging/' & $states.input.batchId & '/sales.csv' & \"'\" & ' AND order_status = ' & \"'\" & 'Completed' & \"'\" & ') TO ' & \"'\" & 's3://<SALES_BUCKET>/automated/validation/' & $states.input.batchId & '/' & \"'\" & ' WITH (format = ' & \"'\" & 'PARQUET' & \"'\" & ', compression = ' & \"'\" & 'SNAPPY' & \"'\" & ')' %}",
+        "QueryExecutionContext": {
+          "Database": "<GLUE_DATABASE>",
+          "Catalog": "AwsDataCatalog"
+        },
+        "WorkGroup": "<ATHENA_WORKGROUP>"
+      },
+      "Output": {
+        "batchId": "{% $states.input.batchId %}",
+        "stagingUri": "{% $states.input.stagingUri %}",
+        "validationPrefix": "{% 's3://<SALES_BUCKET>/automated/validation/' & $states.input.batchId & '/' %}",
+        "transformationQueryExecutionId": "{% $states.result.QueryExecution.QueryExecutionId %}",
+        "objectId": "{% $states.input.objectId %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "RunQualityCheck"
+    },
+    "RunQualityCheck": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "{% 'SELECT COUNT(*) AS total_records, COUNT(DISTINCT order_id) AS unique_orders, COUNT_IF(order_id IS NULL OR TRIM(order_id) = ' & \"'\" & '' & \"'\" & ') AS missing_order_ids, COUNT_IF(customer_id IS NULL OR TRIM(customer_id) = ' & \"'\" & '' & \"'\" & ') AS missing_customers, COUNT_IF(quantity IS NULL OR quantity <= 0) AS invalid_quantities, COUNT_IF(revenue IS NULL OR revenue < 0) AS invalid_revenue FROM <GLUE_DATABASE>.sales_validation WHERE \"$path\" LIKE ' & \"'\" & 's3://<SALES_BUCKET>/automated/validation/' & $states.input.batchId & '/%' & \"'\" %}",
+        "QueryExecutionContext": {
+          "Database": "<GLUE_DATABASE>",
+          "Catalog": "AwsDataCatalog"
+        },
+        "WorkGroup": "<ATHENA_WORKGROUP>"
+      },
+      "Output": {
+        "batchId": "{% $states.input.batchId %}",
+        "validationPrefix": "{% $states.input.validationPrefix %}",
+        "qualityQueryExecutionId": "{% $states.result.QueryExecution.QueryExecutionId %}",
+        "objectId": "{% $states.input.objectId %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "GetQualityResults"
+    },
+    "GetQualityResults": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:athena:getQueryResults",
+      "Arguments": {
+        "QueryExecutionId": "{% $states.input.qualityQueryExecutionId %}",
+        "MaxResults": 2
+      },
+      "Output": {
+        "batchId": "{% $states.input.batchId %}",
+        "validationPrefix": "{% $states.input.validationPrefix %}",
+        "resultRows": "{% $states.result.ResultSet.Rows %}",
+        "objectId": "{% $states.input.objectId %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "EvaluateQuality"
+    },
+    "EvaluateQuality": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Condition": "{% $count($states.input.resultRows) = 2 and $number($states.input.resultRows[1].Data[0].VarCharValue) > 0 and $number($states.input.resultRows[1].Data[0].VarCharValue) = $number($states.input.resultRows[1].Data[1].VarCharValue) and $number($states.input.resultRows[1].Data[2].VarCharValue) = 0 and $number($states.input.resultRows[1].Data[3].VarCharValue) = 0 and $number($states.input.resultRows[1].Data[4].VarCharValue) = 0 and $number($states.input.resultRows[1].Data[5].VarCharValue) = 0 %}",
+          "Next": "QualityPassed"
+        }
+      ],
+      "Default": "MarkFailed"
+    },
+    "QualityPassed": {
+      "Type": "Pass",
+      "Next": "PublishCuratedBatch"
+    },
+    "DuplicateFile": {
+      "Type": "Succeed"
+    },
+    "InvalidFile": {
+      "Type": "Fail",
+      "Error": "InvalidSalesFile",
+      "Cause": "Expected versioned CSV under incoming/sales/."
+    },
+    "PublishCuratedBatch": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Arguments": {
+        "FunctionName": "arn:aws:lambda:us-east-1:<AWS_ACCOUNT_ID>:function:<PUBLISH_LAMBDA_NAME>",
+        "Payload": {
+          "batchId": "{% $states.input.batchId %}"
+        }
+      },
+      "Output": {
+        "objectId": "{% $states.input.objectId %}",
+        "batchId": "{% $states.input.batchId %}",
+        "curatedPrefix": "{% $states.result.Payload.curatedPrefix %}",
+        "publishedObjectCount": "{% $states.result.Payload.publishedObjectCount %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "RegisterAthenaPartition"
+    },
+    "MarkCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "<INGESTION_LEDGER_TABLE>",
+        "Key": {
+          "objectId": {
+            "S": "{% $states.input.objectId %}"
+          }
+        },
+        "UpdateExpression": "SET #status = :completed, batchId = :batch, curatedPrefix = :prefix, completedAt = :at, publishedObjectCount = :count",
+        "ConditionExpression": "#status = :processing",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":completed": {
+            "S": "COMPLETED"
+          },
+          ":processing": {
+            "S": "PROCESSING"
+          },
+          ":batch": {
+            "S": "{% $states.input.batchId %}"
+          },
+          ":prefix": {
+            "S": "{% $states.input.curatedPrefix %}"
+          },
+          ":at": {
+            "S": "{% $now() %}"
+          },
+          ":count": {
+            "N": "{% $string($states.input.publishedObjectCount) %}"
+          }
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "PipelineSucceeded"
+    },
+    "PipelineSucceeded": {
+      "Type": "Succeed"
+    },
+    "MarkFailed": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:updateItem",
+      "Arguments": {
+        "TableName": "<INGESTION_LEDGER_TABLE>",
+        "Key": {
+          "objectId": {
+            "S": "{% $states.input.objectId %}"
+          }
+        },
+        "UpdateExpression": "SET #status = :failed, failedAt = :at",
+        "ConditionExpression": "#status = :processing",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":failed": {
+            "S": "FAILED"
+          },
+          ":processing": {
+            "S": "PROCESSING"
+          },
+          ":at": {
+            "S": "{% $now() %}"
+          }
+        }
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "NotifyFailure"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Arguments": {
+        "TopicArn": "arn:aws:sns:us-east-1:<AWS_ACCOUNT_ID>:<ALERT_TOPIC_NAME>",
+        "Subject": "Gunn sales ingestion pipeline failed",
+        "Message": "{% \"Sales ingestion failed. Execution: \" & $states.context.Execution.Id & \". Inspect Step Functions history and DynamoDB ledger.\" %}"
+      },
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PipelineFailed"
+        }
+      ],
+      "Next": "PipelineFailed"
+    },
+    "PipelineFailed": {
+      "Type": "Fail",
+      "Error": "SalesPipelineFailed",
+      "Cause": "Ingestion, quality validation, publication, or ledger completion failed. Inspect execution history."
+    },
+    "RegisterAthenaPartition": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::athena:startQueryExecution.sync",
+      "Arguments": {
+        "QueryString": "{% 'ALTER TABLE <GLUE_DATABASE>.sales_curated_partitioned ADD IF NOT EXISTS PARTITION (batch_id = ' & \"'\" & $states.input.batchId & \"'\" & ') LOCATION ' & \"'\" & $states.input.curatedPrefix & \"'\" %}",
+        "QueryExecutionContext": {
+          "Database": "<GLUE_DATABASE>",
+          "Catalog": "AwsDataCatalog"
+        },
+        "WorkGroup": "<ATHENA_WORKGROUP>"
+      },
+      "Output": "{% $states.input %}",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "MarkFailed"
+        }
+      ],
+      "Next": "MarkCompleted"
+    }
+  }
+}
